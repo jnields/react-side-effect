@@ -1,6 +1,8 @@
-import React, { Component } from 'react';
-import ExecutionEnvironment from 'exenv';
-import shallowEqual from 'shallowequal';
+import React, { PureComponent } from 'react';
+import hoistNonReactStatics from 'hoist-non-react-statics';
+import exenv from 'exenv';
+
+const getDisplayName = ({ name, displayName }) => displayName || name || 'Component';
 
 export default function withSideEffect(
   reducePropsToState,
@@ -14,11 +16,7 @@ export default function withSideEffect(
     throw new Error('Expected handleStateChangeOnClient to be a function.');
   }
   if (typeof mapStateOnServer !== 'undefined' && typeof mapStateOnServer !== 'function') {
-   throw new Error('Expected mapStateOnServer to either be undefined or a function.');
-  }
-
-  function getDisplayName(WrappedComponent) {
-    return WrappedComponent.displayName || WrappedComponent.name || 'Component';
+    throw new Error('Expected mapStateOnServer to either be undefined or a function.');
   }
 
   return function wrap(WrappedComponent) {
@@ -26,67 +24,76 @@ export default function withSideEffect(
       throw new Error('Expected WrappedComponent to be a React component.');
     }
 
-    let mountedInstances = [];
-    let state;
+    const { Provider, Consumer } = React.createContext();
 
-    function emitChange() {
-      state = reducePropsToState(mountedInstances.map(function (instance) {
-        return instance.props;
-      }));
-
-      if (SideEffect.canUseDOM) {
-        handleStateChangeOnClient(state);
-      } else if (mapStateOnServer) {
-        state = mapStateOnServer(state);
-      }
-    }
-
-    class SideEffect extends Component {
-      // Try to use displayName of wrapped component
-      static displayName = `SideEffect(${getDisplayName(WrappedComponent)})`;
-
-      // Expose canUseDOM so tests can monkeypatch it
-      static canUseDOM = ExecutionEnvironment.canUseDOM;
-
-      static peek() {
-        return state;
+    class SideEffectProvider extends PureComponent {
+      static canUseDOM = exenv.canUseDOM;
+      static get defaultProps() {
+        return { context: { } };
       }
 
-      static rewind() {
-        if (SideEffect.canUseDOM) {
-          throw new Error('You may only call rewind() on the server. Call peek() to read the current state.');
+      createdInstances = [];
+
+      emitChange() {
+        let state = reducePropsToState(this.createdInstances.map(instance => instance.props.props));
+
+        if (SideEffectProvider.canUseDOM) {
+          handleStateChangeOnClient(state);
+        } else if (mapStateOnServer) {
+          state = mapStateOnServer(state);
         }
-
-        let recordedState = state;
-        state = undefined;
-        mountedInstances = [];
-        return recordedState;
-      }
-
-      shouldComponentUpdate(nextProps) {
-        return !shallowEqual(nextProps, this.props);
-      }
-
-      componentWillMount() {
-        mountedInstances.push(this);
-        emitChange();
+        this.props.context.state = state;
       }
 
       componentDidUpdate() {
-        emitChange();
-      }
-
-      componentWillUnmount() {
-        const index = mountedInstances.indexOf(this);
-        mountedInstances.splice(index, 1);
-        emitChange();
+        this.emitChange();
       }
 
       render() {
-        return <WrappedComponent {...this.props} />;
+        return (
+          <Provider value={this}>
+            {this.props.children}
+          </Provider>
+        );
       }
     }
 
-    return SideEffect;
-  }
-}
+    class SideEffectConsumer extends PureComponent {
+      static displayName = 'SideEffectConsumer';
+
+      constructor(props) {
+        super(props);
+        const { provider } = props;
+        provider.createdInstances.push(this);
+        if (exenv.canUseDOM) provider.forceUpdate();
+        else provider.emitChange();
+      }
+
+      componentWillUnmount() {
+        const { provider } = this.props;
+        provider.createdInstances.splice(provider.createdInstances.indexOf(this), 1);
+        if (exenv.canUseDOM) provider.forceUpdate();
+        else provider.emitChange();
+      }
+
+      render() {
+        return this.props.children;
+      }
+    }
+
+    const SideEffect = hoistNonReactStatics(
+      props => (
+        <Consumer>
+          {value => (
+            <SideEffectConsumer provider={value} props={props}>
+              <WrappedComponent {...props} />
+            </SideEffectConsumer>
+          )}
+        </Consumer>
+      ),
+      WrappedComponent,
+    );
+    SideEffect.displayName = `SideEffect(${getDisplayName(WrappedComponent)})`;
+    return { SideEffect, Provider: SideEffectProvider };
+  };
+};
